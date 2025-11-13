@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<module>
+    <name>rmpreordercap</name>
+    <displayName><![CDATA[RM Preorder Cap]]></displayName>
+    <version><![CDATA[1.1.0]]></version>
+    <description><![CDATA[Per-product preorder (backorder) cap and auto-revert on stock arrival for PS 1.7.6]]></description>
+    <author><![CDATA[RockMa Tools]]></author>
+    <tab><![CDATA[administration]]></tab>
+    <is_configurable>0</is_configurable>
+    <need_instance>0</need_instance>
+	<limited_countries></limited_countries>
+</module>

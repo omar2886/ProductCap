@@ -12,7 +12,7 @@ class Rmpreordercap extends Module
         $this->name = 'rmpreordercap';
         $this->tab = 'administration';
         $this->version = '1.1.0';
-        $this->author = 'Eutanasio';
+        $this->author = 'RockMa Tools';
         $this->need_instance = 0;
         $this->bootstrap = true;
         parent::__construct();
@@ -29,13 +29,16 @@ class Rmpreordercap extends Module
         if (!$this->installSql()) {
             return false;
         }
+
         return $this->registerHook('displayAdminProductsExtra')
+            && $this->registerHook('actionProductUpdate')
             && $this->registerHook('actionCartUpdateQuantityBefore')
             && $this->registerHook('actionUpdateQuantity')
             && $this->registerHook('actionObjectStockAvailableUpdateAfter');
     }
 
-    public function uninstall()
+
+public function uninstall()
     {
         $db = Db::getInstance();
         $prefix = _DB_PREFIX_;
@@ -80,42 +83,89 @@ class Rmpreordercap extends Module
         if (!$id_product) {
             return '';
         }
+
         $id_shop = (int)$this->context->shop->id;
         $row = $this->getConfigRow($id_product, $id_shop);
 
-        $token = Tools::getAdminTokenLite('AdminProducts');
         $current_out = (int)StockAvailable::outOfStock($id_product, $id_shop);
         $quantity = (int)StockAvailable::getQuantityAvailableByProduct($id_product, 0, $id_shop);
         $remaining = $this->getPreorderRemaining($id_product, $id_shop, $row);
 
-        if (isset($this->context->controller) && method_exists($this->context->controller, 'addJS')) {
-            $this->context->controller->addJS($this->_path.'views/js/product_admin.js');
-        }
-
         $this->context->smarty->assign(array(
-            'module_dir' => $this->_path,
             'id_product' => $id_product,
             'id_shop' => $id_shop,
-            'rm_enabled' => (int)$row['enabled'],
-            'rm_cap' => (int)$row['cap'],
-            'rm_token' => $token,
             'rm_current_out_of_stock' => $current_out,
             'rm_quantity' => $quantity,
             'rm_remaining' => $remaining,
-            'ajax_url' => $this->_path.'ajax.php',
+            'rm_enabled' => (int)$row['enabled'],
+            'rm_cap' => (int)$row['cap'],
             't_enable' => $this->l('Enable preorder cap'),
             't_cap_units' => $this->l('Cap units (incoming quantity)'),
-            't_help' => $this->l('When enabled, backorders are allowed up to the cap. After reaching the cap or when stock becomes positive again, backorders will be blocked automatically.'),
-            't_save' => $this->l('Save'),
-            't_saving' => $this->l('Saving...'),
-            't_saved' => $this->l('Saved'),
-            't_error' => $this->l('Error'),
-            't_network_error' => $this->l('Network error'),
+            't_help' => $this->l('When enabled, backorders are allowed up to the specified cap; once the total preordered quantity reaches the cap, backorders are blocked automatically.'),
         ));
 
         return $this->display(__FILE__, 'views/templates/hook/product_extra.tpl');
     }
 
+    public function hookActionProductUpdate($params)
+    {
+        $id_product = 0;
+
+        if (isset($params['id_product'])) {
+            $id_product = (int)$params['id_product'];
+        } elseif (isset($params['product']) && isset($params['product']->id)) {
+            $id_product = (int)$params['product']->id;
+        }
+
+        if ($id_product <= 0) {
+            return;
+        }
+
+        $id_shop = (int)$this->context->shop->id;
+
+        $enabledRaw = Tools::getValue('rmcap_enabled', null);
+        $capRaw = Tools::getValue('rmcap_cap', null);
+
+        // If fields are not present, this save did not come from the full product form
+        if ($enabledRaw === null && $capRaw === null) {
+            return;
+        }
+
+        $enabled = (int)$enabledRaw;
+        $cap = (int)$capRaw;
+        if ($cap < 0) {
+            $cap = 0;
+        }
+
+        if ($enabled) {
+            $row = $this->getConfigRow($id_product, $id_shop);
+
+            $orig = null;
+            if ($row && array_key_exists('original_out_of_stock', $row) && $row['original_out_of_stock'] !== null) {
+                $orig = (int)$row['original_out_of_stock'];
+            }
+            if ($orig === null) {
+                $orig = (int)StockAvailable::outOfStock($id_product, $id_shop);
+            }
+
+            StockAvailable::setProductOutOfStock($id_product, 1, $id_shop);
+            $this->setConfigRow($id_product, $id_shop, 1, $cap, $orig);
+        } else {
+            $row = $this->getConfigRow($id_product, $id_shop);
+            $orig = 0;
+            if ($row && array_key_exists('original_out_of_stock', $row) && $row['original_out_of_stock'] !== null) {
+                $orig = (int)$row['original_out_of_stock'];
+            }
+
+            StockAvailable::setProductOutOfStock($id_product, (int)$orig, $id_shop);
+            $this->setConfigRow($id_product, $id_shop, 0, 0, $orig);
+        }
+
+        $cacheKey = (int)$id_product.'_'.$id_shop;
+        if (isset(self::$productConfigCache[$cacheKey])) {
+            unset(self::$productConfigCache[$cacheKey]);
+        }
+    }
     public function hookActionCartUpdateQuantityBefore($params)
     {
         $id_product = isset($params['id_product']) ? (int)$params['id_product'] : 0;
@@ -132,27 +182,36 @@ class Rmpreordercap extends Module
             return;
         }
 
-        $id_shop = (int)$this->context->shop->id;
+        $id_shop = (int)$cart->id_shop;
+        if ($id_shop <= 0) {
+            $id_shop = (int)$this->context->shop->id;
+        }
+
         $row = $this->getConfigRow($id_product, $id_shop);
         if (!(int)$row['enabled'] || (int)$row['cap'] <= 0) {
             return;
         }
 
         $allowedTotal = $this->getAllowedTotalForCart($id_product, $id_shop, $row);
-        $inCart = $this->getCartQuantityForProduct($cart->id, $id_product);
+        $currentInCart = $this->getCartQuantityForProduct((int)$cart->id, $id_product);
 
-        $targetQty = $inCart;
-        if ($op === 'up') {
-            $targetQty = $inCart + $deltaQty;
-        } elseif ($op === 'down') {
-            $targetQty = max(0, $inCart - $deltaQty);
-        } elseif ($deltaQty > 0) {
-            $targetQty = $deltaQty;
+        // Compute what the new quantity in cart would be
+        $newQty = $currentInCart;
+        if ($op === 'up' || $op === '+') {
+            $newQty = $currentInCart + $deltaQty;
+        } elseif ($op === 'down' || $op === '-') {
+            $newQty = max(0, $currentInCart - $deltaQty);
+        } elseif ($op === null || $op === 'update') {
+            // Direct set
+            if ($deltaQty > 0) {
+                $newQty = $deltaQty;
+            }
         }
 
-        if ($targetQty > $allowedTotal) {
-            $remain = max(0, $allowedTotal - $inCart);
-            $message = $this->l('Preorder limit reached for this product. Remaining allowable quantity: ').(int)$remain;
+        if ($newQty > $allowedTotal) {
+            $remaining = $this->getPreorderRemaining($id_product, $id_shop, $row);
+            $message = $this->l('The requested quantity exceeds the allowed preorder limit for this product.');
+
             $isAjax = (bool)Tools::getValue('ajax');
             if ($isAjax) {
                 header('Content-Type: application/json');
@@ -171,19 +230,39 @@ class Rmpreordercap extends Module
 
     public function hookActionUpdateQuantity($params)
     {
-        if (isset($params['id_product'])) {
-            $this->maybeDisablePreorder((int)$params['id_product'], (int)$this->context->shop->id);
+        $id_product = isset($params['id_product']) ? (int)$params['id_product'] : 0;
+        $id_product_attribute = isset($params['id_product_attribute']) ? (int)$params['id_product_attribute'] : 0;
+        $id_shop = isset($params['id_shop']) ? (int)$params['id_shop'] : (int)$this->context->shop->id;
+
+        if ($id_product <= 0 || $id_product_attribute > 0 || $id_shop <= 0) {
+            return;
         }
+
+        $this->maybeDisablePreorder($id_product, $id_shop);
     }
 
     public function hookActionObjectStockAvailableUpdateAfter($params)
     {
-        if (isset($params['object']) && isset($params['object']->id_product)) {
-            $this->maybeDisablePreorder((int)$params['object']->id_product, (int)$this->context->shop->id);
+        if (!isset($params['object']) || !($params['object'] instanceof StockAvailable)) {
+            return;
         }
+        /** @var StockAvailable $stock */
+        $stock = $params['object'];
+        $id_product = (int)$stock->id_product;
+        $id_product_attribute = (int)$stock->id_product_attribute;
+        $id_shop = (int)$stock->id_shop;
+
+        if ($id_product <= 0 || $id_product_attribute > 0 || $id_shop <= 0) {
+            return;
+        }
+
+        $this->maybeDisablePreorder($id_product, $id_shop);
     }
 
-    protected function getConfigRow($id_product, $id_shop)
+
+
+
+protected function getConfigRow($id_product, $id_shop)
     {
         $cacheKey = (int)$id_product.'_'.$id_shop;
         if (isset(self::$productConfigCache[$cacheKey])) {
